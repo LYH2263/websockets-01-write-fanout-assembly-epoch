@@ -1906,3 +1906,125 @@ class MiscTests(unittest.TestCase):
         logger = logging.getLogger("test")
         server = Protocol(SERVER, logger=logger)
         self.assertIs(server.logger, logger)
+
+
+class FanoutTests(ProtocolTestCase):
+    """
+    Test fanout ledgers and assembly epochs.
+
+    """
+
+    def test_fanout_bind_creates_ledger(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        self.assertEqual(server.fanout_ledgers[1].epoch, 0)
+        self.assertEqual(server.fanout_ledgers[1].staged, [])
+        self.assertEqual(server.assembly_epoch, 0)
+
+    def test_fanout_unbind_discards_ledger_and_staged(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.fanout_unbind(1)
+        self.assertNotIn(1, server.fanout_ledgers)
+        # Unbinding an unknown scope is a no-op.
+        server.fanout_unbind(2)
+
+    def test_fanout_stage_text_and_flush_on_server(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.fanout_flush(1)
+        self.assertFrameSent(server, Frame(TEXT, b"Spam"))
+
+    def test_fanout_stage_binary_and_flush_on_client(self):
+        client = Protocol(CLIENT)
+        client.fanout_bind(1)
+        client.fanout_stage(1, "send_binary", b"Spam")
+        client.fanout_flush(1)
+        self.assertFrameSent(client, Frame(BINARY, b"Spam"))
+
+    def test_fanout_flush_without_staged_writes_nothing(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_flush(1)
+        self.assertFrameSent(server, None)
+
+    def test_fanout_advance_discards_staged_and_bumps_epochs(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.fanout_advance(1)
+        self.assertEqual(server.fanout_ledgers[1].epoch, 1)
+        self.assertEqual(server.fanout_ledgers[1].staged, [])
+        self.assertEqual(server.assembly_epoch, 1)
+        # The staged intent of the old epoch can never be written.
+        server.fanout_flush(1)
+        self.assertFrameSent(server, None)
+
+    def test_fanout_advance_keeps_scopes_independent(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_bind(2)
+        server.fanout_stage(1, "send_text", b"one")
+        server.fanout_stage(2, "send_text", b"two")
+        server.fanout_advance(1)
+        # Scope 2 staged write survives scope 1 advancing.
+        server.fanout_flush(2)
+        self.assertFrameSent(server, Frame(TEXT, b"two"))
+
+    def test_fanout_flush_keeps_staged_during_fragmented_message(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.send_text(b"x", fin=False)
+        self.assertFrameSent(server, Frame(TEXT, b"x", fin=False))
+        server.fanout_stage(1, "send_text", b"after")
+        # While the fragmented message is in progress, staged writes wait.
+        server.fanout_flush(1)
+        self.assertFrameSent(server, None)
+        # They are emitted once the fragmented message ends.
+        server.send_continuation(b"y", fin=True)
+        server.fanout_flush(1)
+        self.assertEqual(
+            [
+                self.parse(
+                    write,
+                    mask=server.side is CLIENT,
+                    extensions=server.extensions,
+                )
+                for write in server.data_to_send()
+            ],
+            [Frame(CONT, b"y"), Frame(TEXT, b"after")],
+        )
+
+    def test_fanout_flush_discards_staged_when_closing(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.send_close(CloseCode.NORMAL_CLOSURE, "")
+        close_frame = Frame(CLOSE, Close(CloseCode.NORMAL_CLOSURE, "").serialize())
+        self.assertFrameSent(server, close_frame)
+        # Staging after the closing handshake started never reaches the wire.
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.fanout_flush(1)
+        self.assertFrameSent(server, None)
+
+    def test_send_close_discards_staged_fanout(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.send_close(CloseCode.NORMAL_CLOSURE, "")
+        self.assertEqual(server.fanout_ledgers[1].staged, [])
+
+    def test_fail_discards_staged_fanout(self):
+        server = Protocol(SERVER)
+        server.fanout_bind(1)
+        server.fanout_stage(1, "send_text", b"Spam")
+        server.fail(CloseCode.PROTOCOL_ERROR, "")
+        self.assertEqual(server.fanout_ledgers[1].staged, [])
+        self.assertConnectionFailing(server, CloseCode.PROTOCOL_ERROR, "")
+
+    def test_advance_assembly_epoch(self):
+        server = Protocol(SERVER)
+        self.assertEqual(server.advance_assembly_epoch(), 1)
+        self.assertEqual(server.advance_assembly_epoch(), 2)
+        self.assertEqual(server.assembly_epoch, 2)

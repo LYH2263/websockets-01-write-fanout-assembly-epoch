@@ -4,10 +4,10 @@ import asyncio
 import codecs
 import collections
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable
 from typing import Any, Callable, Generic, Literal, TypeVar, overload
 
-from ..exceptions import ConcurrencyError, TooManyFragments
+from ..exceptions import ConcurrencyError, EpochAborted, TooManyFragments
 from ..frames import BINARY, CONT, TEXT, Frame
 from ..typing import Data
 
@@ -57,15 +57,20 @@ class SimpleQueue(Generic[T]):
                 self.get_waiter = None
         return self.queue.popleft()
 
-    def put_back(self, items: Sequence[T]) -> None:
+    def put_back(self, items: Iterable[T]) -> None:
         """Put back items at the front of the queue."""
         assert self.get_waiter is None, "cannot put_back() while get() is running"
-        self.queue.extendleft(reversed(items))
+        self.queue.extendleft(reversed(list(items)))
 
     def abort(self) -> None:
         """Close the queue, raising EOFError in get() if necessary."""
         if self.get_waiter is not None and not self.get_waiter.done():
             self.get_waiter.set_exception(EOFError("stream of frames ended"))
+
+    def abort_epoch(self) -> None:
+        """Abort a pending get() because an assembly epoch was advanced."""
+        if self.get_waiter is not None and not self.get_waiter.done():
+            self.get_waiter.set_exception(EpochAborted("assembly epoch advanced"))
 
 
 class Assembler:
@@ -90,8 +95,9 @@ class Assembler:
         pause: Callable[[], Any] = lambda: None,
         resume: Callable[[], Any] = lambda: None,
     ) -> None:
-        # Queue of incoming frames.
-        self.frames: SimpleQueue[Frame] = SimpleQueue()
+        # Queue of incoming frames, tagged with the assembly epoch at which
+        # they were received.
+        self.frames: SimpleQueue[tuple[Frame, int]] = SimpleQueue()
 
         # We cannot put a hard limit on the size of the queue because a single
         # call to Protocol.data_received() could produce thousands of frames,
@@ -114,8 +120,22 @@ class Assembler:
         # This flag prevents concurrent calls to get() by user code.
         self.get_in_progress = False
 
+        # Epoch of the assembly boundary; frames tagged with an earlier epoch
+        # are discarded instead of being assembled in the current epoch.
+        self.epoch = 0
+
         # This flag marks the end of the connection.
         self.closed = False
+
+    async def get_current_frame(self) -> tuple[Frame, int]:
+        """Fetch the next frame belonging to the current epoch."""
+        # Frames received before an epoch boundary are discarded so that a
+        # fragmented message straddling the boundary can never be returned.
+        while True:
+            frame, epoch = await self.frames.get(not self.closed)
+            self.maybe_resume()
+            if epoch >= self.epoch:
+                return frame, epoch
 
     @overload
     async def get(self, decode: Literal[True]) -> str: ...
@@ -157,29 +177,31 @@ class Assembler:
 
         try:
             # Fetch the first frame.
-            frame = await self.frames.get(not self.closed)
-            self.maybe_resume()
+            frame, frame_epoch = await self.get_current_frame()
             assert frame.opcode is TEXT or frame.opcode is BINARY
             if decode is None:
                 decode = frame.opcode is TEXT
             frames = [frame]
+            epochs = [frame_epoch]
 
             # Fetch subsequent frames for fragmented messages.
             while not frame.fin:
                 try:
-                    frame = await self.frames.get(not self.closed)
+                    frame, frame_epoch = await self.get_current_frame()
                 except asyncio.CancelledError:
                     # Put frames already received back into the queue so that
                     # future calls to get() can return them. The queue may be
                     # non-empty if put() added frames in the same iteration of
                     # the event loop where get() was canceled.
-                    self.frames.put_back(frames)
+                    self.frames.put_back(zip(frames, epochs))
                     raise
-                self.maybe_resume()
+                # EpochAborted propagates: fragments of the old epoch are
+                # discarded and the receive can be retried in the new epoch.
                 assert frame.opcode is CONT
                 if len(frames) >= MAX_FRAGMENTS:
                     raise TooManyFragments(MAX_FRAGMENTS)
                 frames.append(frame)
+                epochs.append(frame_epoch)
 
         finally:
             self.get_in_progress = False
@@ -237,11 +259,10 @@ class Assembler:
 
         # Yield the first frame.
         try:
-            frame = await self.frames.get(not self.closed)
-        except asyncio.CancelledError:
+            frame, _epoch = await self.get_current_frame()
+        except (asyncio.CancelledError, EpochAborted):
             self.get_in_progress = False
             raise
-        self.maybe_resume()
         assert frame.opcode is TEXT or frame.opcode is BINARY
         if decode is None:
             decode = frame.opcode is TEXT
@@ -258,8 +279,11 @@ class Assembler:
             # previous fragments — we're streaming them. Canceling get_iter()
             # here will leave the assembler in a stuck state. Future calls to
             # get() or get_iter() will raise ConcurrencyError.
-            frame = await self.frames.get(not self.closed)
-            self.maybe_resume()
+            try:
+                frame, _epoch = await self.get_current_frame()
+            except EpochAborted:
+                self.get_in_progress = False
+                raise
             assert frame.opcode is CONT
             if decode:
                 yield decoder.decode(frame.data, frame.fin)
@@ -269,9 +293,11 @@ class Assembler:
 
         self.get_in_progress = False
 
-    def put(self, frame: Frame) -> None:
+    def put(self, frame: Frame, epoch: int = 0) -> None:
         """
         Add ``frame`` to the next message.
+
+        ``epoch`` is the assembly epoch at which the frame was received.
 
         Raises:
             EOFError: If the stream of frames has ended.
@@ -280,8 +306,25 @@ class Assembler:
         if self.closed:
             raise EOFError("stream of frames ended")
 
-        self.frames.put(frame)
+        self.frames.put((frame, epoch))
         self.maybe_pause()
+
+    def reset_epoch(self) -> None:
+        """
+        Settle assemblies against a new epoch.
+
+        Aborts a :meth:`get` or :meth:`get_iter` in progress with
+        :exc:`~websockets.exceptions.EpochAborted`; partially assembled
+        fragments are discarded. Frames still queued are discarded lazily by
+        the next :meth:`get` if they belong to the old epoch. This is
+        recoverable: subsequent receives work in the new epoch.
+
+        """
+        if self.closed:
+            return
+        self.epoch += 1
+        # Unblock get() or get_iter() waiting for a frame of the old epoch.
+        self.frames.abort_epoch()
 
     def maybe_pause(self) -> None:
         """Pause the writer if queue is above the high water mark."""

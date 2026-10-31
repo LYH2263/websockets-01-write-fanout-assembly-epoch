@@ -68,6 +68,25 @@ SEND_EOF = b""
 """Sentinel signaling that the TCP connection must be half-closed."""
 
 
+class FanoutLedger:
+    """
+    Ledger of staged fanout writes for one fanout scope.
+
+    A scope is a :class:`~websockets.fanout.Fanout` instance, identified by an
+    opaque token. Bytes are staged for the current epoch; they are emitted only
+    when flushed while the epoch is still current. Advancing the epoch discards
+    staged bytes, which guarantees that obsolete fanout intents are never
+    written, even if the host mismanages its fanout scopes.
+
+    """
+
+    __slots__ = ("epoch", "staged")
+
+    def __init__(self) -> None:
+        self.epoch = 0
+        self.staged: list[bytes] = []
+
+
 class Protocol:
     """
     Sans-I/O implementation of a WebSocket connection.
@@ -158,6 +177,14 @@ class Protocol:
 
         # Exception that caused the parser to stop, chained to ConnectionClosed.
         self.parser_exc: Exception | None = None
+
+        # Fanout ledgers, keyed by the token of each bound fanout scope.
+        # Empty unless the host uses websockets.fanout.Fanout.
+        self.fanout_ledgers: dict[int, FanoutLedger] = {}
+
+        # Epoch of incoming frames; advanced by fanout_advance(). It tags the
+        # assembler, which discards messages assembled across epoch boundaries.
+        self.assembly_epoch = 0
 
     @property
     def state(self) -> State:
@@ -393,6 +420,8 @@ class Protocol:
             data = close.serialize()
         # 7.1.3. The WebSocket Closing Handshake is Started
         self.send_frame(Frame(CLOSE, data))
+        # Data frames staged by fanout scopes can never follow this close frame.
+        self.fanout_discard_staged()
         # Since the state is OPEN, no close frame was received yet.
         # As a consequence, self.close_rcvd_then_sent remains None.
         assert self.close_rcvd is None
@@ -446,6 +475,9 @@ class Protocol:
             ProtocolError: If the code isn't valid.
         """
         # 7.1.7. Fail the WebSocket Connection
+
+        # A failed connection never writes staged fanout data.
+        self.fanout_discard_staged()
 
         # Send a close frame when the state is OPEN (a close frame was already
         # sent if it's CLOSING), except when failing the connection because
@@ -558,6 +590,110 @@ class Protocol:
             return False
         assert self.state is CONNECTING
         return self.eof_sent
+
+    # Public methods for fanout epochs.
+
+    def fanout_bind(self, token: int) -> None:
+        """
+        Register a fanout scope on this connection.
+
+        ``token`` is an opaque identifier of a
+        :class:`~websockets.fanout.Fanout`. A fanout scope must be registered
+        with :meth:`fanout_bind` before staging writes and unregistered with
+        :meth:`fanout_unbind` when it is discarded.
+
+        """
+        self.fanout_ledgers[token] = FanoutLedger()
+
+    def fanout_unbind(self, token: int) -> None:
+        """
+        Unregister a fanout scope and discard its staged writes.
+
+        """
+        # Discarding the FanoutLedger drops staged bytes of every epoch.
+        self.fanout_ledgers.pop(token, None)
+
+    def fanout_stage(self, token: int, send: str, data: BytesLike) -> None:
+        """
+        Stage a fanout data frame for the current epoch of a fanout scope.
+
+        The frame is serialized and parked in the scope's ledger instead of
+        being written immediately. It is emitted by :meth:`fanout_flush` only
+        while the epoch is still current.
+
+        Parameters:
+            token: Identifier of the fanout scope.
+            send: ``"send_text"`` or ``"send_binary"``.
+            data: payload, already converted to bytes.
+
+        """
+        ledger = self.fanout_ledgers[token]
+        if send == "send_text":
+            frame = Frame(TEXT, data)
+        else:
+            frame = Frame(BINARY, data)
+        ledger.staged.append(
+            frame.serialize(
+                mask=self.side is CLIENT,
+                extensions=self.extensions,
+            )
+        )
+
+    def fanout_advance(self, token: int) -> None:
+        """
+        Advance a fanout scope to a new epoch.
+
+        Staged writes that weren't flushed in the current epoch are discarded
+        and can never be written. Also advances the epoch used to tag incoming
+        frames for the assembler.
+
+        """
+        ledger = self.fanout_ledgers[token]
+        ledger.epoch += 1
+        ledger.staged.clear()
+        self.assembly_epoch += 1
+
+    def fanout_flush(self, token: int) -> None:
+        """
+        Emit staged fanout writes of a scope's current epoch.
+
+        Staged bytes are written if the connection is :attr:`OPEN` and no
+        fragmented message is in progress. They remain staged while a
+        fragmented message is in progress, so that they can be flushed once it
+        ends. They are discarded if the connection stopped being open.
+
+        Call :meth:`data_to_send` afterwards and send the resulting data.
+
+        """
+        ledger = self.fanout_ledgers[token]
+        staged = ledger.staged
+        if self.state is OPEN and self.expect_continuation_frame:
+            # Keep staged writes for a flush after the fragmented message ends.
+            return
+        ledger.staged = []
+        if self.state is OPEN:
+            self.writes.extend(staged)
+
+    def fanout_discard_staged(self) -> None:
+        """
+        Discard staged fanout writes of every bound scope.
+
+        Data frames cannot follow a close frame or be sent on a failed
+        connection, so closing or failing invalidates all pending fanout.
+
+        """
+        for ledger in self.fanout_ledgers.values():
+            ledger.staged.clear()
+
+    def advance_assembly_epoch(self) -> int:
+        """
+        Advance the assembly epoch without touching a fanout scope.
+
+        Returns the new assembly epoch.
+
+        """
+        self.assembly_epoch += 1
+        return self.assembly_epoch
 
     # Private methods for receiving data.
 

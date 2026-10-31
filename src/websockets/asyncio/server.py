@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, Self, cast
 from ..exceptions import InvalidHeader
 from ..extensions.base import ServerExtensionFactory
 from ..extensions.permessage_deflate import enable_server_permessage_deflate
+from ..fanout import Fanout
 from ..frames import CloseCode
 from ..headers import (
     build_www_authenticate_basic,
@@ -29,6 +30,7 @@ from .connection import Connection, broadcast
 
 __all__ = [
     "broadcast",
+    "Fanout",
     "serve",
     "unix_serve",
     "ServerConnection",

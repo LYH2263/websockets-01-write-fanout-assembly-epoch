@@ -31,12 +31,13 @@ from ..protocol import CONNECTING, OPEN, Event
 from ..server import ServerProtocol
 from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
 from ..utils import get_socket_name
-from .connection import Connection, broadcast
+from .connection import Connection, Fanout, broadcast
 from .utils import Deadline
 
 
 __all__ = [
     "broadcast",
+    "Fanout",
     "serve",
     "unix_serve",
     "ServerConnection",

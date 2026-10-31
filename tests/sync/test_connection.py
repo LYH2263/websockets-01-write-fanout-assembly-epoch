@@ -1280,6 +1280,315 @@ class ClientConnectionTests(LoggingTestCase, ThreadTestCase):
         with self.assertRaises(TypeError):
             broadcast([self.connection], ["⏳", "⌛️"])
 
+    # Test fanout epochs.
+    # These are cross-host timing acceptance tests over a local socketpair.
+
+    def make_extra_connection(self, protocol=None, **connection_kwargs):
+        """Create an additional local/remote connection pair."""
+        socket_, remote_socket = socket.socketpair()
+        protocol = protocol if protocol is not None else Protocol(self.LOCAL)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        connection = Connection(
+            socket_,
+            protocol,
+            close_timeout=2 * MS,
+            ping_interval=None,
+            **connection_kwargs,
+        )
+        remote_connection = InterceptingConnection(
+            remote_socket,
+            remote_protocol,
+            ping_interval=None,
+        )
+        return connection, remote_connection
+
+    def test_fanout_epoch_discards_staged_write_after_advance(self):
+        """A write staged in epoch N is never sent after advancing to N+1."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+        self.assertEqual(fanout.advance(), 1)
+        fanout.flush()
+        self.assertNoFrameSent()
+        # An immediate fanout in the new epoch still goes out.
+        fanout.send("current")
+        self.assertFrameSent(Frame(TEXT, b"current"))
+        fanout.close()
+
+    def test_fanout_epoch_coordinates_with_fragmented_send(self):
+        """A staged write waits for fragmented sends and is voided on advance."""
+        gate = threading.Event()
+
+        def fragments():
+            yield "first"
+            gate.wait()
+
+        def send_messages():
+            self.connection.send(fragments())
+
+        sender_thread = threading.Thread(target=send_messages)
+        sender_thread.start()
+        time.sleep(MS)
+        self.assertFrameSent(Frame(TEXT, b"first", fin=False))
+
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+        # While the fragmented message is in progress, flushing keeps the
+        # staged write parked instead of emitting it.
+        fanout.flush()
+        self.assertNoFrameSent()
+        # Advancing the epoch voids the parked write for good.
+        fanout.advance()
+
+        gate.set()
+        sender_thread.join(5 * MS)
+        self.assertFalse(sender_thread.is_alive())
+
+        # An immediate fanout in the new epoch works and follows the fragments.
+        fanout.send("current")
+        self.assertFramesSent(
+            [
+                Frame(CONT, b""),
+                Frame(TEXT, b"current"),
+            ]
+        )
+        fanout.close()
+
+    def test_fanout_epoch_close_aborts_pending_recv(self):
+        """Starting the closing handshake voids staged writes; recv gets OK."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+
+        def close_connection():
+            time.sleep(2 * MS)
+            self.connection.close()
+
+        with self.run_in_thread(close_connection):
+            with self.assertRaises(ConnectionClosedOK):
+                self.connection.recv(timeout=1)
+
+        # The staged data frame was discarded; only the close frame was sent.
+        self.assertFrameSent(Frame(CLOSE, b"\x03\xe8"))
+        fanout.close()
+
+    def test_fanout_epoch_fail_aborts_pending_recv(self):
+        """Fail aborts a pending recv: server at once, the client after EOF."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+
+        errors = []
+        done = threading.Event()
+
+        def reader():
+            try:
+                self.connection.recv(timeout=50 * MS)
+            except Exception as exc:
+                errors.append(exc)
+                done.set()
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        time.sleep(MS)  # let the reader block on recv()
+
+        # Delay the remote EOF to expose the server/client timing fork:
+        # the server half-closes immediately on fail; the client waits for
+        # the server's TCP EOF before the failed connection settles.
+        with self.delay_eof_rcvd(30 * MS):
+            self.remote_connection.socket.sendall(b"\xff\xff")
+            time.sleep(5 * MS)
+
+            if self.LOCAL is SERVER:
+                # The server sent its EOF and the 1002 close at once.
+                self.assertTrue(self.connection.protocol.eof_sent)
+            else:
+                # The client is still waiting for the server's TCP EOF.
+                self.assertFalse(done.is_set())
+                self.assertFalse(self.connection.protocol.eof_sent)
+
+            self.wait_for_remote_side()
+            frames_sent = self.remote_connection.protocol.get_frames_rcvd()
+            self.assertEqual([frame.opcode for frame in frames_sent], [CLOSE])
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xea")
+
+        # The remote EOF settles the failed connection on both sides,
+        # aborting the pending recv with a recoverable failure.
+        self.assertTrue(done.wait(40 * MS))
+        reader_thread.join(5 * MS)
+        self.assertFalse(reader_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ConnectionClosedError)
+        self.assertEqual(errors[0].code, CloseCode.ABNORMAL_CLOSURE)
+        self.assertEqual(str(errors[0].__cause__), "invalid opcode")
+        fanout.close()
+
+    def test_fanout_epoch_message_size_limit_fails_connection(self):
+        """Exceeding max_message_size fails the connection with 1009."""
+        connection, remote = self.make_extra_connection(
+            protocol=Protocol(self.LOCAL, max_size=(4, None)),
+        )
+        try:
+            fanout = Fanout([connection])
+            fanout.stage("obsolete")
+            with remote.send_context():
+                remote.protocol.send_frame(Frame(TEXT, b"ca", fin=False))
+            self.wait_for_remote_side()
+            with remote.send_context():
+                # 2 + 3 = 5 bytes exceeds the 4-byte message limit.
+                remote.protocol.send_frame(Frame(CONT, b"fe!", fin=True))
+
+            with self.assertRaises(ConnectionClosedError) as raised:
+                connection.recv(timeout=1)
+            self.assertIsInstance(raised.exception.__cause__, PayloadTooBig)
+
+            frames_sent = remote.protocol.get_frames_rcvd()
+            self.assertEqual(len(frames_sent), 1)
+            self.assertEqual(frames_sent[0].opcode, CLOSE)
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xf1")
+            fanout.close()
+        finally:
+            remote.close()
+            connection.close()
+
+    def test_fanout_epoch_fragment_size_limit_fails_connection(self):
+        """Exceeding max_fragment_size independently fails with 1009."""
+        connection, remote = self.make_extra_connection(
+            protocol=Protocol(self.LOCAL, max_size=(None, 2)),
+        )
+        try:
+            self.assertIsNone(connection.protocol.max_message_size)
+            self.assertEqual(connection.protocol.max_fragment_size, 2)
+
+            with remote.send_context():
+                # The frame itself exceeds the 2-byte fragment limit.
+                remote.protocol.send_frame(Frame(TEXT, b"abc"))
+
+            with self.assertRaises(ConnectionClosedError) as raised:
+                connection.recv(timeout=1)
+            self.assertIsInstance(raised.exception.__cause__, PayloadTooBig)
+            frames_sent = remote.protocol.get_frames_rcvd()
+            self.assertEqual(len(frames_sent), 1)
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xf1")
+        finally:
+            remote.close()
+            connection.close()
+
+    def test_fanout_epoch_assembler_high_water_only_pauses(self):
+        """The assembler high-water mark pauses reads without failing."""
+        connection, remote = self.make_extra_connection(max_queue=(2, 1))
+        try:
+            fanout = Fanout([connection], max_workers=2)
+            # Advancing before anything is queued loses nothing.
+            fanout.advance()
+
+            for index in range(3):
+                remote.send(f"m{index}")
+            time.sleep(2 * MS)
+            self.assertIs(connection.protocol.state, OPEN)
+            self.assertTrue(connection.recv_messages.paused)
+
+            # Immediate fanout still works under backpressure.
+            fanout.send("live")
+            self.wait_for_remote_side()
+            self.assertIn(
+                Frame(TEXT, b"live"),
+                remote.protocol.get_frames_rcvd(),
+            )
+
+            # Draining the assembler resumes reading; the connection is intact.
+            messages = [connection.recv(timeout=1) for _ in range(3)]
+            self.assertEqual(messages, ["m0", "m1", "m2"])
+            self.assertFalse(connection.recv_messages.paused)
+            fanout.close()
+        finally:
+            remote.close()
+            connection.close()
+
+    def test_fanout_epoch_nested_scopes_do_not_cross(self):
+        """An inner fanout can't pollute the outer connections or queues."""
+        connection_a, remote_a = self.make_extra_connection()
+        connection_b, remote_b = self.make_extra_connection()
+        try:
+            outer = Fanout([connection_a, connection_b])
+            with self.assertRaises(RuntimeError):
+                with Fanout([connection_b], max_workers=1) as inner:
+                    outer.stage("outer")
+                    inner.stage("inner")
+                    inner.advance()  # voids "inner" on b
+                    raise RuntimeError("boom")  # inner exits abnormally
+
+            # The inner scope unbound from b only; outer scopes remain.
+            self.assertNotIn(inner.token, connection_b.protocol.fanout_ledgers)
+            self.assertIn(outer.token, connection_b.protocol.fanout_ledgers)
+            self.assertIn(outer.token, connection_a.protocol.fanout_ledgers)
+
+            outer.flush()
+            self.wait_for_remote_side()
+            self.assertEqual(
+                remote_a.protocol.get_frames_rcvd(),
+                [Frame(TEXT, b"outer")],
+            )
+            self.assertEqual(
+                remote_b.protocol.get_frames_rcvd(),
+                [Frame(TEXT, b"outer")],
+            )
+            outer.close()
+        finally:
+            remote_b.close()
+            remote_a.close()
+            connection_b.close()
+            connection_a.close()
+
+    def test_fanout_send_skips_closed_connection(self):
+        """An immediate fanout to a closed connection is skipped silently."""
+        connection, remote = self.make_extra_connection()
+        try:
+            fanout = Fanout([connection])
+            connection.close()
+            with self.assertNoLogs("websockets", logging.WARNING):
+                fanout.send("ignored")
+            self.assertEqual(
+                remote.protocol.get_frames_rcvd(),
+                [Frame(CLOSE, b"\x03\xe8")],
+            )
+            fanout.close()
+        finally:
+            remote.close()
+            connection.close()
+
+    def test_fanout_send_skips_connection_with_send_blocked(self):
+        """An immediate fanout during a fragmented send is reported skipped."""
+        gate = threading.Event()
+
+        def fragments():
+            yield "⏳"
+            gate.wait()
+
+        fanout = Fanout([self.connection])
+        try:
+            with self.run_in_thread(self.connection.send, args=(fragments(),)):
+                self.assertFrameSent(Frame(TEXT, "⏳".encode(), fin=False))
+
+                with self.assertLogs("websockets", logging.WARNING) as logs:
+                    fanout.send("😀")
+                self.assertEqual(
+                    [record.getMessage() for record in logs.records],
+                    ["skipped fanout: sending a fragmented message"],
+                )
+
+                with self.assertRaises(ExceptionGroup) as raised:
+                    fanout.send("😀", raise_exceptions=True)
+                self.assertEqual(
+                    str(raised.exception),
+                    "skipped fanout (1 sub-exception)",
+                )
+                exc = raised.exception.exceptions[0]
+                self.assertEqual(str(exc), "sending a fragmented message")
+                self.assertIsInstance(exc, ConcurrencyError)
+
+                gate.set()
+        finally:
+            gate.set()
+            fanout.close()
+
 
 class ServerConnectionTests(ClientConnectionTests):
     LOCAL = SERVER

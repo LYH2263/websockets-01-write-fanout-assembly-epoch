@@ -23,6 +23,7 @@ from ..exceptions import (
     ProtocolError,
     TooManyFragments,
 )
+from ..fanout import Fanout as BaseFanout
 from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
 from ..protocol import CLOSED, OPEN, Event, Protocol, State
@@ -31,7 +32,7 @@ from .messages import Assembler
 from .utils import Deadline
 
 
-__all__ = ["Connection"]
+__all__ = ["Connection", "Fanout"]
 
 
 class Connection:
@@ -749,7 +750,7 @@ class Connection:
         """
         assert isinstance(event, Frame)
         if event.opcode in DATA_OPCODES:
-            self.recv_messages.put(event)
+            self.recv_messages.put(event, self.protocol.assembly_epoch)
 
         if event.opcode is PONG:
             self.acknowledge_pings(bytes(event.data))
@@ -1102,6 +1103,54 @@ class Connection:
                 except OSError:  # socket already closed
                     pass
 
+    # Fanout epoch support. Called by websockets.fanout.Fanout; see the
+    # ledgers in Protocol for the sans-IO side of the epoch semantics.
+
+    def fanout_bind(self, fanout: BaseFanout) -> None:
+        """Register a fanout scope on this connection."""
+        with self.protocol_mutex:
+            self.protocol.fanout_bind(fanout.token)
+
+    def fanout_unbind(self, fanout: BaseFanout) -> None:
+        """Unregister a fanout scope and discard its staged writes."""
+        with self.protocol_mutex:
+            self.protocol.fanout_unbind(fanout.token)
+
+    def fanout_stage(self, fanout: BaseFanout, send: str, data: bytes) -> None:
+        """Stage a serialized fanout write in the scope's current epoch."""
+        with self.protocol_mutex:
+            self.protocol.fanout_stage(fanout.token, send, data)
+
+    def fanout_flush(self, fanout: BaseFanout) -> None:
+        """Emit staged writes of the scope's current epoch."""
+        with self.protocol_mutex:
+            self.protocol.fanout_flush(fanout.token)
+            self.send_data()
+
+    def fanout_advance(self, fanout: BaseFanout) -> None:
+        """Advance the scope to a new epoch and settle assemblies."""
+        with self.protocol_mutex:
+            self.protocol.fanout_advance(fanout.token)
+            self.recv_messages.reset_epoch()
+
+    def fanout_deliver(self, fanout: BaseFanout, send: str, data: bytes) -> None:
+        """
+        Deliver one fanout write immediately, mirroring broadcast().
+
+        Non-open connections are skipped silently; connections sending a
+        fragmented message raise :exc:`ConcurrencyError`, which the fanout
+        reports as a skipped write.
+
+        """
+        with self.protocol_mutex:
+            if self.protocol.state is not OPEN:
+                return
+            if self.send_in_progress:
+                raise ConcurrencyError("sending a fragmented message")
+            # Call protocol.send_text or send_binary; data is already bytes.
+            getattr(self.protocol, send)(data)
+            self.send_data()
+
     @property
     def close_exc(self) -> ConnectionClosed:
         exc = self.protocol.close_exc
@@ -1282,5 +1331,37 @@ def broadcast(
         raise ExceptionGroup("skipped broadcast", exceptions)
 
 
-# Pretend that broadcast is actually defined in the server module.
+class Fanout(BaseFanout):
+    """
+    Fan out messages to a set of connections, organized in epochs.
+
+    This is the threading integration of
+    :class:`~websockets.fanout.Fanout`. Immediate writes and flushes are
+    dispatched to a :class:`~concurrent.futures.ThreadPoolExecutor`, like
+    :func:`broadcast`. Additional keyword arguments, such as ``max_workers``,
+    configure the thread pool.
+
+    """
+
+    def __init__(
+        self,
+        connections: Iterable[Connection],
+        *,
+        text: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Keep arguments of the thread pool to create one per fanout_each()
+        # call, mirroring broadcast().
+        self.thread_pool_kwargs = kwargs
+        super().__init__(connections, text=text)
+
+    def fanout_each(self, operation: Any) -> None:
+        with concurrent.futures.ThreadPoolExecutor(
+            **self.thread_pool_kwargs
+        ) as executor:
+            executor.map(operation, self.connections)
+
+
+# Pretend that broadcast and Fanout are actually defined in the server module.
 broadcast.__module__ = "websockets.sync.server"
+Fanout.__module__ = "websockets.sync.server"

@@ -18,6 +18,7 @@ from websockets.exceptions import (
     PayloadTooBig,
     TooManyFragments,
 )
+from websockets.fanout import Fanout
 from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 
@@ -1545,6 +1546,313 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
         """broadcast raises TypeError when called with an unsupported type."""
         with self.assertRaises(TypeError):
             broadcast([self.connection], ["⏳", "⌛️"])
+
+    # Test fanout epochs.
+    # These are cross-host timing acceptance tests over a local socketpair.
+
+    async def make_extra_connection(self, protocol=None, **connection_kwargs):
+        """Create an additional local/remote connection pair."""
+        socket_, remote_socket = socket.socketpair()
+        protocol = protocol if protocol is not None else Protocol(self.LOCAL)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        transport, connection = await self.loop.create_connection(
+            lambda: Connection(
+                protocol,
+                close_timeout=2 * MS,
+                ping_interval=None,
+                **connection_kwargs,
+            ),
+            sock=socket_,
+        )
+        _remote_transport, remote_connection = await self.loop.create_connection(
+            lambda: InterceptingConnection(remote_protocol, ping_interval=None),
+            sock=remote_socket,
+        )
+        return transport, connection, remote_connection
+
+    async def test_fanout_epoch_discards_staged_write_after_advance(self):
+        """A write staged in epoch N is never sent after advancing to N+1."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+        self.assertEqual(fanout.advance(), 1)
+        fanout.flush()
+        await self.assertNoFrameSent()
+        # An immediate fanout in the new epoch still goes out.
+        fanout.send("current")
+        await self.assertFrameSent(Frame(TEXT, b"current"))
+        fanout.close()
+
+    async def test_fanout_epoch_coordinates_with_fragmented_send(self):
+        """A staged write waits for fragmented sends and is voided on advance."""
+        gate = asyncio.Event()
+
+        async def fragments():
+            yield "first"
+            await gate.wait()
+
+        send_task = asyncio.create_task(self.connection.send(fragments()))
+        await asyncio.sleep(MS)
+        await self.assertFrameSent(Frame(TEXT, b"first", fin=False))
+
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+        # While the fragmented message is in progress, flushing keeps the
+        # staged write parked instead of emitting it.
+        fanout.flush()
+        await self.assertNoFrameSent()
+        # Advancing the epoch voids the parked write for good.
+        fanout.advance()
+
+        gate.set()
+        await send_task
+
+        # An immediate fanout in the new epoch works and follows the fragments.
+        fanout.send("current")
+        await self.assertFramesSent(
+            [
+                Frame(CONT, b""),
+                Frame(TEXT, b"current"),
+            ]
+        )
+        fanout.close()
+
+    async def test_fanout_epoch_close_aborts_pending_recv(self):
+        """Starting the closing handshake voids staged writes; recv gets OK."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+
+        recv_task = asyncio.create_task(self.connection.recv())
+        await asyncio.sleep(0)  # let the event loop start recv_task
+
+        close_task = asyncio.create_task(self.connection.close())
+        with self.assertRaises(ConnectionClosedOK):
+            await recv_task
+        await close_task
+
+        # The staged data frame was discarded; only the close frame was sent.
+        await self.assertFrameSent(Frame(CLOSE, b"\x03\xe8"))
+        fanout.close()
+
+    async def test_fanout_epoch_fail_aborts_pending_recv(self):
+        """Fail aborts a pending recv: server at once, the client after EOF."""
+        fanout = Fanout([self.connection])
+        fanout.stage("obsolete")
+
+        recv_task = asyncio.create_task(self.connection.recv())
+        await asyncio.sleep(0)  # let the event loop start recv_task
+
+        raised: ConnectionClosedError | None = None
+        # Delay the remote EOF to expose the server/client timing fork:
+        # the server half-closes immediately on fail; the client waits for
+        # the server's TCP EOF before aborting a pending recv.
+        async with self.delay_eof_rcvd(30 * MS):
+            self.remote_connection.transport.write(b"\xff\xff")
+
+            if self.LOCAL is SERVER:
+                with self.assertRaises(ConnectionClosedError) as caught:
+                    await recv_task
+                raised = caught.exception
+                self.assertTrue(self.connection.protocol.eof_sent)
+            else:
+                await asyncio.sleep(10 * MS)
+                self.assertFalse(recv_task.done())
+                self.assertFalse(self.connection.protocol.eof_sent)
+
+            # Both sides sent a 1002 close frame and voided the staged write.
+            await self.wait_for_remote_side()
+            frames_sent = self.remote_connection.protocol.get_frames_rcvd()
+            self.assertEqual([frame.opcode for frame in frames_sent], [CLOSE])
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xea")
+
+        # The delayed server EOF aborts the client's pending recv at last.
+        with self.assertRaises(ConnectionClosedError) as caught:
+            await recv_task
+        raised = raised or caught.exception
+        self.assertEqual(raised.code, CloseCode.ABNORMAL_CLOSURE)
+        self.assertEqual(str(raised.__cause__), "invalid opcode")
+        fanout.close()
+
+    async def test_fanout_epoch_message_size_limit_fails_connection(self):
+        """Exceeding max_message_size fails the connection with 1009."""
+        _transport, connection, remote = await self.make_extra_connection(
+            protocol=Protocol(self.LOCAL, max_size=(4, None)),
+        )
+        try:
+            fanout = Fanout([connection])
+            fanout.stage("obsolete")
+            recv_task = asyncio.create_task(connection.recv())
+            await asyncio.sleep(0)
+
+            async with remote.send_context():
+                remote.protocol.send_frame(Frame(TEXT, b"ca", fin=False))
+            await self.wait_for_remote_side()
+            async with remote.send_context():
+                # 2 + 3 = 5 bytes exceeds the 4-byte message limit.
+                remote.protocol.send_frame(Frame(CONT, b"fe!", fin=True))
+
+            with self.assertRaises(ConnectionClosedError) as raised:
+                await recv_task
+            # Locally, no close code was received; the failure was PayloadTooBig
+            # and a 1009 close frame was sent on the wire.
+            self.assertIsInstance(raised.exception.__cause__, PayloadTooBig)
+
+            frames_sent = remote.protocol.get_frames_rcvd()
+            self.assertEqual(len(frames_sent), 1)
+            self.assertEqual(frames_sent[0].opcode, CLOSE)
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xf1")
+            # The connection failed; the staged fanout was discarded.
+            fanout.close()
+        finally:
+            await remote.close()
+            await connection.close()
+
+    async def test_fanout_epoch_fragment_size_limit_fails_connection(self):
+        """Exceeding max_fragment_size independently fails with 1009."""
+        _transport, connection, remote = await self.make_extra_connection(
+            protocol=Protocol(self.LOCAL, max_size=(None, 2)),
+        )
+        try:
+            self.assertIsNone(connection.protocol.max_message_size)
+            self.assertEqual(connection.protocol.max_fragment_size, 2)
+
+            recv_task = asyncio.create_task(connection.recv())
+            await asyncio.sleep(0)
+            async with remote.send_context():
+                # The frame itself exceeds the 2-byte fragment limit.
+                remote.protocol.send_frame(Frame(TEXT, b"abc"))
+
+            with self.assertRaises(ConnectionClosedError) as raised:
+                await recv_task
+            self.assertIsInstance(raised.exception.__cause__, PayloadTooBig)
+            frames_sent = remote.protocol.get_frames_rcvd()
+            self.assertEqual(len(frames_sent), 1)
+            self.assertEqual(frames_sent[0].data[:2], b"\x03\xf1")
+        finally:
+            await remote.close()
+            await connection.close()
+
+    async def test_fanout_epoch_assembler_high_water_only_pauses(self):
+        """The assembler high-water mark pauses reads without failing."""
+        _transport, connection, remote = await self.make_extra_connection(
+            max_queue=(2, 1),
+        )
+        try:
+            fanout = Fanout([connection])
+            # Advancing before anything is queued loses nothing.
+            fanout.advance()
+
+            for index in range(3):
+                await remote.send(f"m{index}")
+            await asyncio.sleep(2 * MS)
+            self.assertIs(connection.protocol.state, OPEN)
+            self.assertTrue(connection.recv_messages.paused)
+
+            # Immediate fanout still works under backpressure.
+            fanout.send("live")
+            await self.assertFrameSentOn(remote, Frame(TEXT, b"live"))
+
+            # Draining the assembler resumes reading; the connection is intact.
+            messages = [await connection.recv() for _ in range(3)]
+            self.assertEqual(messages, ["m0", "m1", "m2"])
+            self.assertFalse(connection.recv_messages.paused)
+            fanout.close()
+        finally:
+            await remote.close()
+            await connection.close()
+
+    async def assertFrameSentOn(self, remote, frame):
+        """Check that a frame was received by a given remote connection."""
+        await self.wait_for_remote_side()
+        self.assertIn(frame, remote.protocol.get_frames_rcvd())
+
+    async def test_fanout_epoch_nested_scopes_do_not_cross(self):
+        """An inner fanout can't pollute the outer connections or queues."""
+        _transport_a, connection_a, remote_a = await self.make_extra_connection()
+        _transport_b, connection_b, remote_b = await self.make_extra_connection()
+        try:
+            outer = Fanout([connection_a, connection_b])
+            with self.assertRaises(RuntimeError):
+                with Fanout([connection_b]) as inner:
+                    outer.stage("outer")
+                    inner.stage("inner")
+                    inner.advance()  # voids "inner" on b
+                    raise RuntimeError("boom")  # inner exits abnormally
+
+            # The inner scope unbound from b only; outer scopes remain.
+            self.assertNotIn(inner.token, connection_b.protocol.fanout_ledgers)
+            self.assertIn(outer.token, connection_b.protocol.fanout_ledgers)
+            self.assertIn(outer.token, connection_a.protocol.fanout_ledgers)
+
+            outer.flush()
+            await self.wait_for_remote_side()
+            self.assertEqual(
+                remote_a.protocol.get_frames_rcvd(),
+                [Frame(TEXT, b"outer")],
+            )
+            self.assertEqual(
+                remote_b.protocol.get_frames_rcvd(),
+                [Frame(TEXT, b"outer")],
+            )
+            outer.close()
+        finally:
+            await remote_b.close()
+            await remote_a.close()
+            await connection_b.close()
+            await connection_a.close()
+
+    async def test_fanout_send_skips_closed_connection(self):
+        """An immediate fanout to a closed connection is skipped silently."""
+        _transport, connection, remote = await self.make_extra_connection()
+        try:
+            fanout = Fanout([connection])
+            await connection.close()
+            with self.assertNoLogs("websockets", logging.WARNING):
+                fanout.send("ignored")
+            self.assertEqual(
+                remote.protocol.get_frames_rcvd(),
+                [Frame(CLOSE, b"\x03\xe8")],
+            )
+            fanout.close()
+        finally:
+            await remote.close()
+            await connection.close()
+
+    async def test_fanout_send_skips_connection_with_send_blocked(self):
+        """An immediate fanout during a fragmented send is reported skipped."""
+        gate = asyncio.Event()
+
+        async def fragments():
+            yield "⏳"
+            await gate.wait()
+
+        send_task = asyncio.create_task(self.connection.send(fragments()))
+        await asyncio.sleep(MS)
+        await self.assertFrameSent(Frame(TEXT, "⏳".encode(), fin=False))
+
+        fanout = Fanout([self.connection])
+        try:
+            with self.assertLogs("websockets", logging.WARNING) as logs:
+                fanout.send("😀")
+            self.assertEqual(
+                [record.getMessage() for record in logs.records],
+                ["skipped fanout: sending a fragmented message"],
+            )
+
+            with self.assertRaises(ExceptionGroup) as raised:
+                fanout.send("😀", raise_exceptions=True)
+            self.assertEqual(
+                str(raised.exception),
+                "skipped fanout (1 sub-exception)",
+            )
+            exc = raised.exception.exceptions[0]
+            self.assertEqual(str(exc), "sending a fragmented message")
+            self.assertIsInstance(exc, ConcurrencyError)
+
+            gate.set()
+            await send_task
+        finally:
+            gate.set()
+            fanout.close()
 
 
 class ServerConnectionTests(ClientConnectionTests):

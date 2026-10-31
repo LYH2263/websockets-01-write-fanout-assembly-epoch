@@ -25,6 +25,35 @@ fixing regressions shortly after a release.
 Only documented APIs are public. Undocumented, private APIs may change without
 notice.
 
+.. _17.5:
+
+17.5
+----
+
+*Unreleased*
+
+New features
+............
+
+* Added :class:`Fanout` for organizing writes to a set of connections in
+  *epochs*. A fanout can stage write intents in the current epoch and flush
+  them later; advancing to a new epoch discards staged intents of the previous
+  epoch so that they are never written. Fanout scopes nest: an inner scope
+  over a subset of connections keeps independent ledgers, and discarding it
+  never touches outer scopes.
+
+  Advancing an epoch also settles incoming assemblies on member connections:
+  a :meth:`~asyncio.connection.Connection.recv` waiting for a fragmented
+  message is aborted with the new, recoverable
+  :exc:`~exceptions.EpochAborted` exception; the connection stays open and the
+  next receive reads messages assembled in the new epoch.
+
+  :class:`Fanout` is available as :class:`~asyncio.server.Fanout` and
+  :class:`~sync.server.Fanout`; the asyncio integration fans out synchronously
+  like :func:`~asyncio.server.broadcast`, while the threading integration uses
+  a :class:`~concurrent.futures.ThreadPoolExecutor` like
+  :func:`~sync.server.broadcast`.
+
 .. _17.4:
 
 17.4

@@ -29,12 +29,15 @@ __all__ = [
     "Headers",
     "HeadersLike",
     "MultipleValuesError",
+    # .fanout
+    "Fanout",
     # .exceptions
     "ConcurrencyError",
     "ConnectionClosed",
     "ConnectionClosedError",
     "ConnectionClosedOK",
     "DuplicateParameter",
+    "EpochAborted",
     "HeaderLineTooLong",
     "InvalidHandshake",
     "InvalidHeader",
@@ -107,6 +110,7 @@ if TYPE_CHECKING:
         ConnectionClosedError,
         ConnectionClosedOK,
         DuplicateParameter,
+        EpochAborted,
         HeaderLineTooLong,
         InvalidHandshake,
         InvalidHeader,
@@ -136,6 +140,7 @@ if TYPE_CHECKING:
         TooManyHeaders,
         WebSocketException,
     )
+    from .fanout import Fanout
     from .frames import Close, CloseCode, Frame, Opcode
     from .http11 import Request, Response
     from .protocol import Protocol, Side, State
@@ -174,12 +179,15 @@ else:
             "Headers": ".datastructures",
             "HeadersLike": ".datastructures",
             "MultipleValuesError": ".datastructures",
+            # .fanout
+            "Fanout": ".fanout",
             # .exceptions
             "ConcurrencyError": ".exceptions",
             "ConnectionClosed": ".exceptions",
             "ConnectionClosedError": ".exceptions",
             "ConnectionClosedOK": ".exceptions",
             "DuplicateParameter": ".exceptions",
+            "EpochAborted": ".exceptions",
             "HeaderLineTooLong": ".exceptions",
             "InvalidHandshake": ".exceptions",
             "InvalidHeader": ".exceptions",

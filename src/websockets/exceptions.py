@@ -37,6 +37,7 @@
     * :exc:`TooManyFragments`
     * :exc:`InvalidState` (Sans-I/O)
     * :exc:`ConcurrencyError`
+    * :exc:`EpochAborted`
 
 """
 
@@ -81,6 +82,7 @@ __all__ = [
     "PayloadTooBig",
     "InvalidState",
     "ConcurrencyError",
+    "EpochAborted",
 ]
 
 
@@ -528,6 +530,22 @@ class ConcurrencyError(WebSocketException, RuntimeError):
 
     WebSocket is a connection-oriented protocol. Reads must be serialized; so
     must be writes. However, reading and writing concurrently is possible.
+
+    """
+
+
+class EpochAborted(WebSocketException):
+    """
+    Raised when a receive is aborted by crossing an assembly epoch boundary.
+
+    When a :class:`~websockets.fanout.Fanout` advances to a new epoch, a
+    :meth:`~websockets.asyncio.connection.Connection.recv` in progress, waiting
+    for the remaining fragments of a message, is aborted with this exception.
+    Fragments already received belong to the old epoch and are discarded.
+
+    This exception is recoverable: the connection remains open and calling
+    :meth:`~websockets.asyncio.connection.Connection.recv` again reads messages
+    assembled in the new epoch.
 
     """
 

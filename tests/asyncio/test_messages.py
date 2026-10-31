@@ -6,7 +6,7 @@ import unittest.mock
 from websockets.asyncio import messages
 from websockets.asyncio.messages import *
 from websockets.asyncio.messages import SimpleQueue
-from websockets.exceptions import ConcurrencyError, TooManyFragments
+from websockets.exceptions import ConcurrencyError, EpochAborted, TooManyFragments
 from websockets.frames import BINARY, CONT, TEXT, Frame
 
 from ..utils import alist
@@ -68,6 +68,14 @@ class SimpleQueueTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)  # let the event loop start getter_task
         self.queue.abort()
         with self.assertRaises(EOFError):
+            await getter_task
+
+    async def test_abort_epoch(self):
+        """abort_epoch throws EpochAborted in get."""
+        getter_task = asyncio.create_task(self.queue.get())
+        await asyncio.sleep(0)  # let the event loop start getter_task
+        self.queue.abort_epoch()
+        with self.assertRaises(EpochAborted):
             await getter_task
 
 
@@ -443,6 +451,76 @@ class AssemblerTests(unittest.IsolatedAsyncioTestCase):
         self.assembler.put(Frame(CONT, b"e", fin=False))
         self.assembler.put(Frame(CONT, b"a"))
         self.pause.assert_not_called()
+
+    # Test assembly epochs.
+
+    async def test_get_aborted_when_epoch_advances(self):
+        """reset_epoch aborts a get waiting for a frame with EpochAborted."""
+        getter_task = asyncio.create_task(self.assembler.get())
+        await asyncio.sleep(0)  # let the event loop start getter_task
+        self.assembler.reset_epoch()
+        with self.assertRaises(EpochAborted):
+            await getter_task
+
+        # The receive is recoverable in the new epoch.
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = await self.assembler.get()
+        self.assertEqual(message, "new")
+
+    async def test_get_aborted_mid_fragmented_message(self):
+        """reset_epoch discards fragments already received in the old epoch."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        getter_task = asyncio.create_task(self.assembler.get())
+        await asyncio.sleep(0)  # let the event loop start getter_task
+        self.assembler.reset_epoch()
+        with self.assertRaises(EpochAborted):
+            await getter_task
+
+        # Neither the old fragment nor an old continuation can be assembled.
+        self.assembler.put(Frame(CONT, b"fe"), epoch=0)
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = await self.assembler.get()
+        self.assertEqual(message, "new")
+
+    async def test_stale_queued_frames_are_discarded(self):
+        """Frames queued before an epoch boundary are discarded lazily."""
+        self.assembler.put(Frame(TEXT, b"old"))
+        # No get is in progress; reset_epoch only bumps the epoch.
+        self.assembler.reset_epoch()
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = await self.assembler.get()
+        self.assertEqual(message, "new")
+
+    async def test_get_iter_aborted_before_first_frame(self):
+        """reset_epoch aborts get_iter waiting for its first frame."""
+        getter_task = asyncio.create_task(alist(self.assembler.get_iter()))
+        await asyncio.sleep(0)  # let the event loop start getter_task
+        self.assembler.reset_epoch()
+        with self.assertRaises(EpochAborted):
+            await getter_task
+
+        # The receive is recoverable in the new epoch.
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        fragments = await alist(self.assembler.get_iter())
+        self.assertEqual(fragments, ["new"])
+
+    async def test_get_iter_aborted_between_fragments(self):
+        """reset_epoch aborts get_iter waiting for a continuation frame."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        iterator = aiter(self.assembler.get_iter())
+        async with contextlib.aclosing(iterator):
+            self.assertEqual(await anext(iterator), "ca")
+            getter_task = asyncio.create_task(anext(iterator))
+            await asyncio.sleep(0)  # let the event loop start getter_task
+            self.assembler.reset_epoch()
+            with self.assertRaises(EpochAborted):
+                await getter_task
+
+    async def test_reset_epoch_after_close_is_noop(self):
+        """reset_epoch doesn't change the epoch after close is called."""
+        self.assembler.close()
+        self.assembler.reset_epoch()
+        self.assertEqual(self.assembler.epoch, 0)
 
     # Test termination.
 

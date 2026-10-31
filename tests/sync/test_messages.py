@@ -3,7 +3,7 @@ import time
 import unittest
 import unittest.mock
 
-from websockets.exceptions import ConcurrencyError, TooManyFragments
+from websockets.exceptions import ConcurrencyError, EpochAborted, TooManyFragments
 from websockets.frames import BINARY, CONT, TEXT, Frame
 from websockets.sync import messages
 from websockets.sync.messages import *
@@ -404,6 +404,100 @@ class AssemblerTests(ThreadTestCase):
         self.assembler.put(Frame(CONT, b"e", fin=False))
         self.assembler.put(Frame(CONT, b"a"))
         self.pause.assert_not_called()
+
+    # Test assembly epochs.
+
+    def test_get_aborted_when_epoch_advances(self):
+        """reset_epoch aborts a get waiting for a frame with EpochAborted."""
+
+        def advance():
+            time.sleep(2 * MS)
+            self.assembler.reset_epoch()
+
+        with self.run_in_thread(advance):
+            with self.assertRaises(EpochAborted):
+                self.assembler.get(timeout=1)
+
+        # The receive is recoverable in the new epoch.
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = self.assembler.get()
+        self.assertEqual(message, "new")
+
+    def test_get_aborted_mid_fragmented_message(self):
+        """reset_epoch discards fragments already received in the old epoch."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+
+        def advance():
+            time.sleep(2 * MS)
+            self.assembler.reset_epoch()
+
+        with self.run_in_thread(advance):
+            with self.assertRaises(EpochAborted):
+                self.assembler.get(timeout=1)
+
+        # Neither the old fragment nor an old continuation can be assembled.
+        self.assembler.put(Frame(CONT, b"fe"), epoch=0)
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = self.assembler.get()
+        self.assertEqual(message, "new")
+
+    def test_stale_queued_frames_are_discarded(self):
+        """Frames queued before an epoch boundary are discarded lazily."""
+        self.assembler.put(Frame(TEXT, b"old"))
+        # No get is in progress; reset_epoch only bumps the epoch.
+        self.assembler.reset_epoch()
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        message = self.assembler.get()
+        self.assertEqual(message, "new")
+
+    def test_get_iter_aborted_before_first_frame(self):
+        """reset_epoch aborts get_iter waiting for its first frame."""
+
+        def advance():
+            time.sleep(2 * MS)
+            self.assembler.reset_epoch()
+
+        with self.run_in_thread(advance):
+            with self.assertRaises(EpochAborted):
+                for _ in self.assembler.get_iter():
+                    self.fail("no fragment expected")
+
+        # The receive is recoverable in the new epoch.
+        self.assembler.put(Frame(TEXT, b"new"), epoch=1)
+        fragments = list(self.assembler.get_iter())
+        self.assertEqual(fragments, ["new"])
+
+    def test_get_iter_aborted_between_fragments(self):
+        """reset_epoch aborts get_iter waiting for a continuation frame."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        iterator = self.assembler.get_iter()
+        self.assertEqual(next(iterator), "ca")
+
+        def advance():
+            time.sleep(2 * MS)
+            self.assembler.reset_epoch()
+
+        with self.run_in_thread(advance):
+            with self.assertRaises(EpochAborted):
+                next(iterator)
+
+    def test_reset_epoch_after_close_is_noop(self):
+        """reset_epoch doesn't change the epoch after close is called."""
+        self.assembler.close()
+        self.assembler.reset_epoch()
+        self.assertEqual(self.assembler.epoch, 0)
+
+    def test_get_after_epoch_abort_and_close_raises_eof(self):
+        """A queued epoch abort hides behind close: get raises EOFError."""
+
+        def advance_then_close():
+            time.sleep(2 * MS)
+            self.assembler.reset_epoch()
+            self.assembler.close()
+
+        with self.run_in_thread(advance_then_close):
+            with self.assertRaises(EOFError):
+                self.assembler.get(timeout=1)
 
     # Test termination.
 

@@ -6,7 +6,7 @@ import queue
 import threading
 from typing import Any, Callable, Iterable, Iterator, Literal, overload
 
-from ..exceptions import ConcurrencyError, TooManyFragments
+from ..exceptions import ConcurrencyError, EpochAborted, TooManyFragments
 from ..frames import BINARY, CONT, TEXT, Frame
 from ..typing import Data
 from .utils import Deadline
@@ -17,6 +17,16 @@ __all__ = ["Assembler"]
 UTF8Decoder = codecs.getincrementaldecoder("utf-8")
 
 MAX_FRAGMENTS = int(os.environ.get("WEBSOCKETS_MAX_FRAGMENTS", "4096"))
+
+
+# Sentinel queued to abort a blocked get() when an assembly epoch advances.
+class EpochAbortMarker:
+    pass
+
+
+EPOCH_ABORT = EpochAbortMarker()
+
+FrameQueueItem = tuple[Frame, int] | EpochAbortMarker | None
 
 
 class Assembler:
@@ -45,8 +55,10 @@ class Assembler:
         # primitives provided by the threading and queue modules.
         self.mutex = threading.Lock()
 
-        # Queue of incoming frames.
-        self.frames: queue.SimpleQueue[Frame | None] = queue.SimpleQueue()
+        # Queue of incoming frames, tagged with the assembly epoch at which
+        # they were received. None marks the end of the stream and
+        # EPOCH_ABORT an assembly epoch boundary.
+        self.frames: queue.SimpleQueue[FrameQueueItem] = queue.SimpleQueue()
 
         # We cannot put a hard limit on the size of the queue because a single
         # call to Protocol.data_received() could produce thousands of frames,
@@ -69,15 +81,19 @@ class Assembler:
         # This flag prevents concurrent calls to get() by user code.
         self.get_in_progress = False
 
+        # Epoch of the assembly boundary; frames tagged with an earlier epoch
+        # are discarded instead of being assembled in the current epoch.
+        self.epoch = 0
+
         # This flag marks the end of the connection.
         self.closed = False
 
-    def get_next_frame(self, timeout: float | None = None) -> Frame:
+    def get_next_frame(self, timeout: float | None = None) -> tuple[Frame, int]:
         # Helper to factor out the logic for getting the next frame from the
         # queue, while handling timeouts and reaching the end of the stream.
         if self.closed:
             try:
-                frame = self.frames.get(block=False)
+                item = self.frames.get(block=False)
             except queue.Empty:
                 raise EOFError("stream of frames ended") from None
         else:
@@ -85,23 +101,39 @@ class Assembler:
                 # Check for a frame that's already received if timeout <= 0.
                 # SimpleQueue.get() doesn't support negative timeout values.
                 if timeout is not None and timeout <= 0:
-                    frame = self.frames.get(block=False)
+                    item = self.frames.get(block=False)
                 else:
-                    frame = self.frames.get(block=True, timeout=timeout)
+                    item = self.frames.get(block=True, timeout=timeout)
             except queue.Empty:
                 raise TimeoutError(f"timed out in {timeout:.1f}s") from None
-        if frame is None:
+        if item is None:
             raise EOFError("stream of frames ended")
-        return frame
+        if isinstance(item, EpochAbortMarker):
+            if self.closed:
+                # Closure is terminal: an epoch boundary queued just before
+                # closing doesn't hide the end of the stream.
+                raise EOFError("stream of frames ended")
+            raise EpochAborted("assembly epoch advanced")
+        return item
 
-    def reset_queue(self, frames: Iterable[Frame]) -> None:
+    def get_current_frame(self, timeout: float | None = None) -> tuple[Frame, int]:
+        # Fetch the next frame belonging to the current epoch. Frames received
+        # before an epoch boundary are discarded so that a fragmented message
+        # straddling the boundary can never be returned.
+        while True:
+            frame, epoch = self.get_next_frame(timeout)
+            with self.mutex:
+                self.maybe_resume()
+            if epoch >= self.epoch:
+                return frame, epoch
+
+    def reset_queue(self, frames: Iterable[tuple[Frame, int]]) -> None:
         # Helper to put frames back into the queue after they were fetched.
         # This happens only when the queue is empty. However, by the time
         # we acquire self.mutex, put() may have added items in the queue.
         # Therefore, we must handle the case where the queue is not empty.
-        frame: Frame | None
         with self.mutex:
-            queued = []
+            queued: list[FrameQueueItem] = []
             try:
                 while True:
                     queued.append(self.frames.get(block=False))
@@ -110,8 +142,8 @@ class Assembler:
             for frame in frames:
                 self.frames.put(frame)
             # This loop runs only when a race condition occurs.
-            for frame in queued:  # pragma: no cover
-                self.frames.put(frame)
+            for item in queued:  # pragma: no cover
+                self.frames.put(item)
 
     # This overload structure is required to avoid the error:
     # "parameter without a default follows parameter with a default"
@@ -169,31 +201,33 @@ class Assembler:
             deadline = Deadline(timeout)
 
             # Fetch the first frame.
-            frame = self.get_next_frame(deadline.timeout(raise_if_elapsed=False))
-            with self.mutex:
-                self.maybe_resume()
+            frame, frame_epoch = self.get_current_frame(
+                deadline.timeout(raise_if_elapsed=False)
+            )
             assert frame.opcode is TEXT or frame.opcode is BINARY
             if decode is None:
                 decode = frame.opcode is TEXT
             frames = [frame]
+            epochs = [frame_epoch]
 
             # Fetch subsequent frames for fragmented messages.
             while not frame.fin:
                 try:
-                    frame = self.get_next_frame(
+                    frame, frame_epoch = self.get_current_frame(
                         deadline.timeout(raise_if_elapsed=False)
                     )
                 except TimeoutError:
                     # Put frames already received back into the queue
                     # so that future calls to get() can return them.
-                    self.reset_queue(frames)
+                    self.reset_queue(zip(frames, epochs))
                     raise
-                with self.mutex:
-                    self.maybe_resume()
+                # EpochAborted propagates: fragments of the old epoch are
+                # discarded and the receive can be retried in the new epoch.
                 assert frame.opcode is CONT
                 if len(frames) >= MAX_FRAGMENTS:
                     raise TooManyFragments(MAX_FRAGMENTS)
                 frames.append(frame)
+                epochs.append(frame_epoch)
 
         finally:
             self.get_in_progress = False
@@ -251,9 +285,11 @@ class Assembler:
         # get_in_progress remains set and the connection becomes unusable.
 
         # Yield the first frame.
-        frame = self.get_next_frame()
-        with self.mutex:
-            self.maybe_resume()
+        try:
+            frame, _epoch = self.get_current_frame()
+        except EpochAborted:
+            self.get_in_progress = False
+            raise
         assert frame.opcode is TEXT or frame.opcode is BINARY
         if decode is None:
             decode = frame.opcode is TEXT
@@ -266,9 +302,11 @@ class Assembler:
 
         # Yield subsequent frames for fragmented messages.
         while not frame.fin:
-            frame = self.get_next_frame()
-            with self.mutex:
-                self.maybe_resume()
+            try:
+                frame, _epoch = self.get_current_frame()
+            except EpochAborted:
+                self.get_in_progress = False
+                raise
             assert frame.opcode is CONT
             if decode:
                 yield decoder.decode(frame.data, frame.fin)
@@ -278,9 +316,11 @@ class Assembler:
 
         self.get_in_progress = False
 
-    def put(self, frame: Frame) -> None:
+    def put(self, frame: Frame, epoch: int = 0) -> None:
         """
         Add ``frame`` to the next message.
+
+        ``epoch`` is the assembly epoch at which the frame was received.
 
         Raises:
             EOFError: If the stream of frames has ended.
@@ -290,8 +330,29 @@ class Assembler:
             if self.closed:
                 raise EOFError("stream of frames ended")
 
-            self.frames.put(frame)
+            self.frames.put((frame, epoch))
             self.maybe_pause()
+
+    def reset_epoch(self) -> None:
+        """
+        Settle assemblies against a new epoch.
+
+        Aborts a :meth:`get` or :meth:`get_iter` in progress with
+        :exc:`~websockets.exceptions.EpochAborted`; partially assembled
+        fragments are discarded. Frames still queued are discarded lazily by
+        the next :meth:`get` if they belong to the old epoch. This is
+        recoverable: subsequent receives work in the new epoch.
+
+        """
+        with self.mutex:
+            if self.closed:
+                return
+            self.epoch += 1
+            # Unblock get() or get_iter() waiting for a frame of the old epoch.
+            # Without a get in progress, stale queued frames are filtered by
+            # their epoch tag on the next get(); no sentinel is needed.
+            if self.get_in_progress:
+                self.frames.put(EPOCH_ABORT)
 
     # put() and get/get_iter() call maybe_pause() and maybe_resume() while
     # holding self.mutex. This guarantees that the calls interleave properly.
